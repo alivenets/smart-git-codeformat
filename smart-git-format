@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+
+import sys
+import json
+import subprocess
+import glob
+
+
+LINE_PORCELAIN_RECORD_LINE_COUNT = 12
+
+def parse_blame_record(line_list):
+# Example blame lines:
+#  c477125a7c93c1e7ea77a051a99b8ded8ef56143 2 2 1
+#  author Tobias Olausson
+#  author-mail <tobias.olausson@pelagicore.com>
+#  author-time 1484322672
+#  author-tz +0100
+#  committer Therese Nordqvist
+#  committer-mail <therese.nordqvist@pelagicore.com>
+#  committer-time 1484329264
+#  committer-tz +0100
+#  summary Updates copyright headers to 2016-2017
+#  filename libsoftwarecontainer/src/gateway/network/networkgateway.cpp
+#           * Copyright (C) 2016-2017 Pelagicore AB
+    if len(line_list) != LINE_PORCELAIN_RECORD_LINE_COUNT:
+        raise Exception("Invalid parse input: wrong line count of line blame record: {}".format(len(line_list)))
+    rec = {}
+    rec['line'] = int(line_list[0].split(' ')[2])
+    # Store author as tuple (name, email)
+    rec['author'] = (
+        line_list[1].replace('author ', '').strip("\n"),
+        line_list[2].replace('author-mail ', '').strip("\n")
+        )
+    return rec
+
+def call_git_blame(filename):
+    # git blame --line-porcelain HEAD {filename} | grep -v "^previous"
+    args = ["git", "blame", "--line-porcelain", "HEAD", "\"{}\"".format(filename), "|", "grep", "-v", "\"^previous\""]
+    cmd_line = " ".join(args)
+    p = subprocess.run(cmd_line, shell=True, capture_output=True, text=True)
+    p.check_returncode()
+    return p.stdout
+
+def parse_git_blame_output(filename):
+    blame_objects = []
+    blame_line_list = []
+    cnt = 0
+    proc_output = call_git_blame(filename)
+    for line in proc_output.splitlines():
+        blame_line_list.append(line)
+        cnt += 1
+
+        if cnt == LINE_PORCELAIN_RECORD_LINE_COUNT:
+            blame_obj = parse_blame_record(blame_line_list)
+            blame_obj['filename'] = filename
+            blame_objects.append(blame_obj)
+            blame_line_list = []
+            cnt = 0
+
+    return blame_objects
+
+def call_clang_format_tool(filename, blame_records=None):
+    args = ["clang-format", "-i", "--verbose"]
+
+    if blame_records is not None:
+        args += list(["--lines={}:{}".format(x['line'], x['end-line']) for x in blame_records])
+
+    args.append("\"{}\"".format(filename))
+    cmd_line = " ".join(args)
+    p = subprocess.run(cmd_line, shell=True, capture_output=True, text=True)
+    p.check_returncode()
+
+def call_git_status_filter_changed():
+    # git status --porcelain=2 --untracked-files=no | awk '{print $9}'
+    args = ["git", "status", "--porcelain=2", "--untracked-files=no", "|", "awk", "'{print $9}'"]
+    cmd_line = " ".join(args)
+    p = subprocess.run(cmd_line, shell=True, capture_output=True, text=True)
+    p.check_returncode()
+    return p.stdout
+
+def call_git_commit(file_list, author, commit_message):
+    args = ["git", "commit", "--author=\"{} {}\"".format(author[0], author[1]), "-m", "\"{}\"".format(commit_message)]
+    args += file_list
+    cmd_line = " ".join(args)
+    p = subprocess.run(cmd_line, shell=True, capture_output=True, text=True)
+    p.check_returncode()
+
+def generate_blame_intervals(blame_objects):
+    '''
+        Merge adjacent file lines and generate blame intervals
+    '''
+    new_objs = []
+    cur_obj = None
+    for obj in blame_objects:
+        if not cur_obj:
+            cur_obj = obj
+            cur_obj['end-line'] = cur_obj['line']
+            continue
+
+        if obj['author'][0] == cur_obj['author'] and obj['line'] == cur_obj['end-line'] + 1:
+            cur_obj['end-line'] = obj['line']
+        else:
+            new_objs.append(cur_obj)
+            cur_obj = obj
+            cur_obj['end-line'] = cur_obj['line']
+
+    new_objs.append(cur_obj)
+
+    return new_objs
+
+def get_changed_files():
+    return call_git_status_filter_changed().splitlines()
+
+def main(argv):
+    # Get filenames as executable arguments: wildcards or direct filenames
+    print("[0] Prepare")
+
+    if len(get_changed_files()) != 0:
+        print("ERROR: cannot work with dirty repository. Please save your changes and proceed with clean state")
+        return 1
+
+    filename_glob_list = argv[1:]
+
+    authors_list = []
+
+    # TODO: ignore submodules
+    filtered_filenames = []
+    for fg in filename_glob_list:
+        filtered_filenames += glob.glob(fg)
+
+    print("[0] Collected filenames: {}".format(filtered_filenames))
+
+    # Pass 1. Collect all authors
+    print ("[1] Collect all authors")
+
+    for filename in filtered_filenames:
+        rec_list = parse_git_blame_output(filename)
+        authors = [x['author'] for x in rec_list]
+        # Insert authors into unique authors list
+        # TODO: optimize the loop
+        for a in authors:
+            if a not in authors_list:
+                authors_list.append(a)
+
+    print("[1] RESULT: (unique list of authors")
+    for a in authors_list:
+        print(a)
+
+    # Pass 2. For each author, collect intervals in files and apply them
+    # NOTE: after each commit, we need to call 'blame' again
+    #       (clang-format may format the whole function if function title is formatted)
+    # TODO: implement replacement list of authors and prioritization of commits
+    #       due to following cases: author is out of project, author name is a collision with other name,
+    print("[2] For each author, make changes and commit")
+
+    for author in authors_list:
+        # NOTE: we have to rescan the whole file list again after git commit,
+        # since side effects of formatting tools may result in changing lines of other authors
+
+        changed_file_list = get_changed_files()
+        if len(changed_file_list) != 0:
+            print("[2]: Author: {}, cannot collect changes before previous changes are committed. Consistency error.")
+            return 1
+
+        for filename in filtered_filenames:
+            print("[2] Author: {}, process {}".format(author, filename))
+            # Filter output from git blame
+            rec_list = parse_git_blame_output(filename)
+            # Generate interval-based output from git blame to make less calls to format tool
+            blame_rec = generate_blame_intervals(rec_list)
+            # Filter records by author
+            blame_rec = [x for x in blame_rec if x['author'] == author]
+
+            # TODO: consider also cmake-format and other formatters
+            call_clang_format_tool(filename, blame_rec)
+
+        # After all files are formatted, collect changed files and commit them
+        changed_file_list = get_changed_files()
+        if len(changed_file_list) == 0:
+            print("[2] Author: {}, changes in files might have been overwritten by ither authors. Consider prioritization if you want to make this author more important".format(author, filename))
+            continue
+
+        # Commit all changed files
+        commit_message = "style: Reformat the code \n\nAuthored-By: {} {}".format(author[0], author[1])
+        call_git_commit(changed_file_list, author, commit_message)
+
+    print("[3] Final reformat, use first author to reformat all sources")
+    author = authors[0]
+
+    for filename in filtered_filenames:
+        print("[3] Author: {}, process {}".format(author, filename))
+        call_clang_format_tool(filename)
+
+        changed_file_list = get_changed_files()
+        if len(changed_file_list) == 0:
+            print("[3] Author: {}, no changes".format(author, filename))
+            continue
+
+        commit_message = "style: Reformat the code \n\nAuthored-By: {} {}".format(author[0], author[1])
+        call_git_commit([filename], author, commit_message)
+
+    return 0
+
+if __name__ == "__main__":
+    ret = main(sys.argv)
+    exit(ret)
