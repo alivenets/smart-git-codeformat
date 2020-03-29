@@ -5,8 +5,28 @@ import json
 import subprocess
 import glob
 import argparse
+import collections
+import itertools
 
 LINE_PORCELAIN_RECORD_LINE_COUNT = 12
+
+class Author(object):
+    ''' Helper class to manipulate author name and email separately.
+    Behaves as a string
+    '''
+    def __init__(self, name, email):
+        self.name = name
+        self.email = email
+
+    def __hash__(self):
+        return hash(self.__str__())
+
+    def __eq__(self, other):
+        return self.name == other.name and self.email == other.email
+    def __repr__(self):
+        return "Author({},{})".format(self.name, self.email)
+    def __str__(self):
+        return "{} {}".format(self.name, self.email)
 
 def parse_blame_record(line_list):
 # Example blame lines:
@@ -27,7 +47,7 @@ def parse_blame_record(line_list):
     rec = {}
     rec['line'] = int(line_list[0].split(' ')[2])
     # Store author as tuple (name, email)
-    rec['author'] = (
+    rec['author'] = Author(
         line_list[1].replace('author ', '').strip("\n"),
         line_list[2].replace('author-mail ', '').strip("\n")
         )
@@ -98,7 +118,7 @@ def call_git_status_filter_changed():
     return p.stdout
 
 def call_git_commit(file_list, author, commit_message):
-    args = ["git", "commit", "--author=\"{} {}\"".format(author[0], author[1]), "-m", "\"{}\"".format(commit_message)]
+    args = ["git", "commit", "--author=\"{} {}\"".format(author.name, author.email), "-m", "\"{}\"".format(commit_message)]
     args += file_list
     cmd_line = " ".join(args)
     p = subprocess.run(cmd_line, shell=True, capture_output=True, text=True)
@@ -116,7 +136,7 @@ def generate_blame_intervals(blame_objects):
             cur_obj['end-line'] = cur_obj['line']
             continue
 
-        if obj['author'][0] == cur_obj['author'] and obj['line'] == cur_obj['end-line'] + 1:
+        if obj['author'] == cur_obj['author'] and obj['line'] == cur_obj['end-line'] + 1:
             cur_obj['end-line'] = obj['line']
         else:
             new_objs.append(cur_obj)
@@ -130,37 +150,10 @@ def generate_blame_intervals(blame_objects):
 def get_changed_files():
     return call_git_status_filter_changed().splitlines()
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--only-authors', action='store_true',
-                       help='Collect info about authors and exit')
-    parser.add_argument("--tool", default="clang", choices=["clang", "cmake"], help="Formatter to use")
-    parser.add_argument('files', nargs='*', help="Files to format")
-
-    args = parser.parse_args()
-
-    print("[0] Prepare")
-
-    if len(get_changed_files()) != 0:
-        print("ERROR: cannot work with dirty repository. Please save your changes and proceed with clean state")
-        return 1
-
-    # Get filenames as executable arguments: wildcards or direct filenames
-    filename_glob_list = args.files
-
+def collect_authors(files):
     authors_list = []
 
-    # TODO: ignore submodules
-    filtered_filenames = []
-    for fg in filename_glob_list:
-        filtered_filenames += glob.glob(fg)
-
-    print("[0] Collected filenames: {}".format(filtered_filenames))
-
-    # Pass 1. Collect all authors
-    print ("[1] Collect all authors")
-
-    for filename in filtered_filenames:
+    for filename in files:
         rec_list = parse_git_blame_output(filename)
         authors = [x['author'] for x in rec_list]
         # Insert authors into unique authors list
@@ -168,14 +161,31 @@ def main():
         for a in authors:
             if a not in authors_list:
                 authors_list.append(a)
+    return authors_list
+
+def get_requested_files(files):
+    # TODO: ignore submodules
+    filtered_filenames = []
+    for file_glob in files:
+        filtered_filenames += glob.glob(file_glob)
+    return filtered_filenames
+
+def run_line_based_algorithm(args):
+    # Pass 0. Prepare
+    print("- SMART GIT FORMAT - : Line based algorithm")
+
+    print("[0] Prepare")
+
+    filtered_filenames = get_requested_files(args.files)
+    print("[0] Collected filenames: {}".format(filtered_filenames))
+
+    # Pass 1. Collect all authors
+    print ("[1] Collect all authors")
+    authors_list = collect_authors(filtered_filenames)
 
     print("[1] RESULT: unique list of authors")
     for a in authors_list:
         print(a)
-
-    if args.only_authors:
-        # Exit since 'only_authors' is set
-        return 0
 
     # Pass 2. For each author, collect intervals in files and apply them
     # NOTE: after each commit, we need to call 'blame' again
@@ -211,11 +221,11 @@ def main():
             continue
 
         # Commit all changed files
-        commit_message = "style: Reformat the code \n\nAuthored-By: {} {}".format(author[0], author[1])
+        commit_message = "style: Reformat the code \n\nAuthored-By: {}".format(author)
         call_git_commit(changed_file_list, author, commit_message)
 
     print("[3] Final reformat, use first author to reformat all sources")
-    author = authors[0]
+    author = authors_list[0]
 
     for filename in filtered_filenames:
         print("[3] Author: {}, process {}".format(author, filename))
@@ -226,11 +236,89 @@ def main():
             print("[3] Author: {}, no changes".format(author, filename))
             continue
 
-        commit_message = "style: Reformat the code \n\nAuthored-By: {} {}".format(author[0], author[1])
+        commit_message = "style: Apply formatting tool to the files (line-based) \n\nAuthored-By: {}".format(author)
         call_git_commit([filename], author, commit_message)
 
-    return 0
+def run_file_based_algorithm(args):
+    print("- SMART GIT FORMAT - : File based algorithm")
+    filtered_filenames = get_requested_files(args.files)
+
+    authors_list = collect_authors(filtered_filenames)
+
+    authors_and_files = []
+    for filename in filtered_filenames:
+            # Filter output from git blame
+            rec_list = parse_git_blame_output(filename)
+            author_list = [x['author'] for x in rec_list]
+            c = collections.Counter(author_list)
+            best_author = c.most_common(1)[0][0]
+
+            authors_and_files.append((best_author, filename))
+            # TODO: calculate count of authors and sort them
+
+    authors_grouped = []
+    # authors_and_files contain the list of files which should be formatted by author.
+    # Now, group them and run formatting
+    for key, group in itertools.groupby(authors_and_files, key=lambda x: x[0]):
+        # for i,j in g:
+            # print(k,i,j)
+        authors_grouped.append((key,[x[1] for x in group]))
+
+    for item in authors_grouped:
+        author = item[0]
+        files = item[1]
+
+        for filename in files:
+            print("Author: {}, process {}".format(author, filename))
+            run_format_tool(filename, args.tool)
+
+        changed_file_list = get_changed_files()
+
+        if len(changed_file_list) == 0:
+            print("Author: {}, no changes".format(author, files))
+            continue
+
+        # Commit all changed files
+        commit_message = "style: Apply formatting tool to the files \n\nAuthored-By: {}".format(author)
+        call_git_commit(changed_file_list, author, commit_message)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--only-authors', action='store_true',
+                        help='Collect info about authors and exit')
+    parser.add_argument("--tool", default="clang", choices=["clang", "cmake"], help="Formatter to use")
+    parser.add_argument("--algo", default="lines", choices=["lines", "files"], help="Stats calculation algorithm to use")
+    parser.add_argument('files', nargs='*', help="Files to format")
+
+    args = parser.parse_args()
+
+    if len(get_changed_files()) != 0:
+        print("ERROR: cannot work with dirty repository. Please save your changes and proceed with clean state")
+        return 1
+
+    if args.only_authors:
+        files = get_requested_files(args.files)
+        authors_list = collect_authors(files)
+        for author in authors_list:
+            print("{}".format(author))
+        return 0
+
+    ret = 0
+    if args.algo == "lines":
+        ret = run_line_based_algorithm(args)
+    elif args.algo == "files":
+        ret = run_file_based_algorithm(args)
+    else:
+        raise Exception("Invalid algorithm {}".format(args.algo))
+
+    return ret
 
 if __name__ == "__main__":
-    ret = main()
+    ret = -1
+
+    try:
+        ret = main()
+    except:
+        pass
+
     exit(ret)
