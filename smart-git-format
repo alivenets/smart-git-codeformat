@@ -61,6 +61,7 @@ def call_git_blame(filename):
     p.check_returncode()
     return p.stdout
 
+
 def parse_git_blame_output(filename):
     blame_objects = []
     blame_line_list = []
@@ -150,6 +151,12 @@ def generate_blame_intervals(blame_objects):
 def get_changed_files():
     return call_git_status_filter_changed().splitlines()
 
+def is_file_in_git(file):
+    args = ["git", "ls-files", "--error-unmatch", file]
+    cmd_line = " ".join(args)
+    p = subprocess.run(cmd_line, shell=True, capture_output=True, text=True)
+    return p.returncode == 0
+
 def collect_authors(files):
     authors_list = []
 
@@ -164,10 +171,10 @@ def collect_authors(files):
     return authors_list
 
 def get_requested_files(files):
-    # TODO: ignore submodules
     filtered_filenames = []
     for file_glob in files:
         filtered_filenames += glob.glob(file_glob)
+    filtered_filenames = [x for x in filtered_filenames if is_file_in_git(x)]
     return filtered_filenames
 
 def run_line_based_algorithm(args):

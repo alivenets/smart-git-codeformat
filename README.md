@@ -22,7 +22,6 @@ The script collects authors from the files, then for each author, the script upd
   1. comments formatting
   2. `#include`s formatting. HINT: One of the options may be: the last one (or the main one designated in priority list, reformats the file in the end again to have consistent formatting)
 
-* Ignore submodules
 * Optimize python loops
 * Consider cmake-format, clang-format and other formatting tools
 * Use prioritized author lists to select author commit priority; also, consider author replacement with another author
