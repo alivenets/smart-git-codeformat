@@ -59,6 +59,25 @@ def parse_git_blame_output(filename):
 
     return blame_objects
 
+def run_format_tool(filename, tool_name, blame_lines=None):
+    if tool_name == "clang":
+        call_clang_format_tool(filename, blame_lines)
+    elif tool_name == "cmake":
+        call_cmake_format_tool(filename, blame_lines)
+    else:
+        raise Exception("Tool {} is not supported".format(tool_name))
+
+def call_cmake_format_tool(filename, blame_records=None):
+    args = ["cmake-format", "-i"]
+
+    if blame_records is not None:
+        raise Exception("cmake-format does not support formatting by lines")
+
+    args.append("\"{}\"".format(filename))
+    cmd_line = " ".join(args)
+    p = subprocess.run(cmd_line, shell=True, capture_output=True, text=True)
+    p.check_returncode()
+
 def call_clang_format_tool(filename, blame_records=None):
     args = ["clang-format", "-i", "--verbose"]
 
@@ -115,6 +134,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--only-authors', action='store_true',
                        help='Collect info about authors and exit')
+    parser.add_argument("--tool", default="clang", choices=["clang", "cmake"], help="Formatter to use")
     parser.add_argument('files', nargs='*', help="Files to format")
 
     args = parser.parse_args()
@@ -182,8 +202,7 @@ def main():
             # Filter records by author
             blame_rec = [x for x in blame_rec if x['author'] == author]
 
-            # TODO: consider also cmake-format and other formatters
-            call_clang_format_tool(filename, blame_rec)
+            run_format_tool(filename, args.tool, blame_rec)
 
         # After all files are formatted, collect changed files and commit them
         changed_file_list = get_changed_files()
@@ -200,7 +219,7 @@ def main():
 
     for filename in filtered_filenames:
         print("[3] Author: {}, process {}".format(author, filename))
-        call_clang_format_tool(filename)
+        run_format_tool(filename, args.tool)
 
         changed_file_list = get_changed_files()
         if len(changed_file_list) == 0:
