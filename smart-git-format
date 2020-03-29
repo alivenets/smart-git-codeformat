@@ -4,7 +4,7 @@ import sys
 import json
 import subprocess
 import glob
-
+import argparse
 
 LINE_PORCELAIN_RECORD_LINE_COUNT = 12
 
@@ -111,15 +111,22 @@ def generate_blame_intervals(blame_objects):
 def get_changed_files():
     return call_git_status_filter_changed().splitlines()
 
-def main(argv):
-    # Get filenames as executable arguments: wildcards or direct filenames
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--only-authors', action='store_true',
+                       help='Collect info about authors and exit')
+    parser.add_argument('files', nargs='*', help="Files to format")
+
+    args = parser.parse_args()
+
     print("[0] Prepare")
 
     if len(get_changed_files()) != 0:
         print("ERROR: cannot work with dirty repository. Please save your changes and proceed with clean state")
         return 1
 
-    filename_glob_list = argv[1:]
+    # Get filenames as executable arguments: wildcards or direct filenames
+    filename_glob_list = args.files
 
     authors_list = []
 
@@ -142,9 +149,13 @@ def main(argv):
             if a not in authors_list:
                 authors_list.append(a)
 
-    print("[1] RESULT: (unique list of authors")
+    print("[1] RESULT: unique list of authors")
     for a in authors_list:
         print(a)
+
+    if args.only_authors:
+        # Exit since 'only_authors' is set
+        return 0
 
     # Pass 2. For each author, collect intervals in files and apply them
     # NOTE: after each commit, we need to call 'blame' again
@@ -202,5 +213,5 @@ def main(argv):
     return 0
 
 if __name__ == "__main__":
-    ret = main(sys.argv)
+    ret = main()
     exit(ret)
