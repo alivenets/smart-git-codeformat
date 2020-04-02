@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import sys
 import json
 import subprocess
@@ -7,6 +8,7 @@ import glob
 import argparse
 import collections
 import itertools
+import traceback
 
 LINE_PORCELAIN_RECORD_LINE_COUNT = 12
 
@@ -23,6 +25,13 @@ class Author(object):
 
     def __eq__(self, other):
         return self.name == other.name and self.email == other.email
+
+    def __lt__(self, other):
+        return self.name < other.name
+
+    def __gt__(self, other):
+        return self.name > other.name
+
     def __repr__(self):
         return "Author({},{})".format(self.name, self.email)
     def __str__(self):
@@ -59,7 +68,8 @@ def _run_process(cmd_line):
 
 def call_git_blame(filename):
     # git blame --line-porcelain HEAD {filename} | grep -v "^previous"
-    args = ["git", "blame", "--line-porcelain", "HEAD", "\"{}\"".format(filename), "|", "grep", "-v", "\"^previous\""]
+    # suppress grep return code if the file is empty
+    args = ["git", "blame", "--line-porcelain", "HEAD", "\"{}\"".format(filename), "|", "grep", "-v", "\"^previous\"", "||", "true"]
     cmd_line = " ".join(args)
     p = _run_process(cmd_line)
     p.check_returncode()
@@ -84,27 +94,35 @@ def parse_git_blame_output(filename):
 
     return blame_objects
 
-def run_format_tool(filename, tool_name, blame_lines=None):
+def run_format_tool(filename, tool_name, blame_lines=None, config_file=None):
     if tool_name == "clang":
-        call_clang_format_tool(filename, blame_lines)
+        call_clang_format_tool(filename, blame_lines, config_file)
     elif tool_name == "cmake":
-        call_cmake_format_tool(filename, blame_lines)
+        call_cmake_format_tool(filename, blame_lines, config_file)
+    elif tool_name == "uncrustify":
+        call_uncrustify_tool(filename, blame_lines, config_file)
     else:
         raise Exception("Tool {} is not supported".format(tool_name))
 
-def call_cmake_format_tool(filename, blame_records=None):
+def call_cmake_format_tool(filename, blame_records=None, config_file=None):
     args = ["cmake-format", "-i"]
 
+    if config_file is not None:
+        args += ["-c", config_file]
+
     if blame_records is not None:
-        raise Exception("cmake-format does not support formatting by lines")
+        raise Exception("cmake-format: formatting by lines is not supported (TODO)")
 
     args.append("\"{}\"".format(filename))
     cmd_line = " ".join(args)
     p = _run_process(cmd_line)
     p.check_returncode()
 
-def call_clang_format_tool(filename, blame_records=None):
+def call_clang_format_tool(filename, blame_records=None, config_file=None):
     args = ["clang-format", "-i", "--verbose"]
+
+    if config_file is not None:
+        raise Exception("clang-format: config file option is not supported (TODO)")
 
     if blame_records is not None:
         args += list(["--lines={}:{}".format(x['line'], x['end-line']) for x in blame_records])
@@ -113,6 +131,22 @@ def call_clang_format_tool(filename, blame_records=None):
     cmd_line = " ".join(args)
     p = _run_process(cmd_line)
     p.check_returncode()
+
+def call_uncrustify_tool(filename, blame_records=None, config_file=None):
+    args = ["uncrustify"]
+
+    if config_file is not None:
+        args += ["-c", config_file]
+
+    if blame_records is not None:
+        raise Exception("uncrustify: formatting by lines is not supported (TODO)")
+
+    args += ["-f", "\"{}\"".format(filename), "-o", "\"{}\"".format(filename)]
+
+    cmd_line = " ".join(args)
+    p = _run_process(cmd_line)
+    # FIXME: uncrustify returns 1 if file is reformatted
+    # p.check_returncode()
 
 def call_git_status_filter_changed():
     # git status --porcelain=2 --untracked-files=no | awk '{print $9}'
@@ -223,7 +257,7 @@ def run_line_based_algorithm(args):
             # Filter records by author
             blame_rec = [x for x in blame_rec if x['author'] == author]
 
-            run_format_tool(filename, args.tool, blame_rec)
+            run_format_tool(filename, args.tool, blame_rec, args.tool_config)
 
         # After all files are formatted, collect changed files and commit them
         changed_file_list = get_changed_files()
@@ -240,7 +274,7 @@ def run_line_based_algorithm(args):
 
     for filename in filtered_filenames:
         print("[3] Author: {}, process {}".format(author, filename))
-        run_format_tool(filename, args.tool)
+        run_format_tool(filename, args.tool, blame_lines=None, config_file=args.tool_config)
 
         changed_file_list = get_changed_files()
         if len(changed_file_list) == 0:
@@ -260,12 +294,20 @@ def run_file_based_algorithm(args):
     for filename in filtered_filenames:
             # Filter output from git blame
             rec_list = parse_git_blame_output(filename)
+
+            if len(rec_list) == 0:
+                print("NOTE: file {} blame is empty, skipping".format(filename))
+                continue
+
             author_list = [x['author'] for x in rec_list]
             c = collections.Counter(author_list)
             best_author = c.most_common(1)[0][0]
 
             authors_and_files.append((best_author, filename))
             # TODO: calculate count of authors and sort them
+
+    # itertools.groupby requires list sorted by the grouped key
+    authors_and_files.sort(key=lambda x:x[0])
 
     authors_grouped = []
     # authors_and_files contain the list of files which should be formatted by author.
@@ -281,7 +323,7 @@ def run_file_based_algorithm(args):
 
         for filename in files:
             print("Author: {}, process {}".format(author, filename))
-            run_format_tool(filename, args.tool)
+            run_format_tool(filename, args.tool, blame_lines=None, config_file=args.tool_config)
 
         changed_file_list = get_changed_files()
 
@@ -297,7 +339,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--only-authors', action='store_true',
                         help='Collect info about authors and exit')
-    parser.add_argument("--tool", default="clang", choices=["clang", "cmake"], help="Formatter to use")
+    parser.add_argument("--tool", default="clang", choices=["clang", "cmake", "uncrustify"], help="Formatter to use")
+    parser.add_argument("--tool-config", type=str)
     parser.add_argument("--algo", default="lines", choices=["lines", "files"], help="Stats calculation algorithm to use")
     parser.add_argument('files', nargs='*', help="Files to format")
 
@@ -305,6 +348,10 @@ def main():
 
     if len(get_changed_files()) != 0:
         print("ERROR: cannot work with dirty repository. Please save your changes and proceed with clean state")
+        return 1
+
+    if (args.tool_config is not None) and (not os.path.exists(args.tool_config)):
+        print("ERROR: tool configuration file does not exist")
         return 1
 
     if args.only_authors:
